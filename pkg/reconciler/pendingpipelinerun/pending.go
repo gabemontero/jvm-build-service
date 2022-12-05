@@ -21,8 +21,10 @@ import (
 
 const (
 	//TODO add fields for both constants to jbsconfig, systemconfig, or both
-	abandonAfter   = 3 * time.Hour
-	requeueAfter   = 1 * time.Minute
+	abandonAfter = 3 * time.Hour
+	requeueAfter = 1 * time.Minute
+	//TODO subtracting 1 for the jvm-bld-svc artifact cache, then another 3 for safety buffer, but tuning this default after broader testing likely
+	quotaBuffer    = 4
 	contextTimeout = 300 * time.Second
 
 	//TODO move to API folder, along with config obj changes
@@ -69,45 +71,68 @@ func (r *ReconcilePendingPipelineRun) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, pr.Namespace))
 	}
 
-	if pr.Spec.Status == "" {
-		return reconcile.Result{}, nil
+	if pr.IsPending() {
+		return r.handlePending(ctx, pr)
 	}
 
-	val, ok := pr.Annotations[AbandonedAnnotation]
-	condition := pr.Status.GetCondition(apis.ConditionSucceeded)
-	needToAddAbandonReasonMessage := condition == nil || condition.Reason != AbandonedReason
-	if pr.IsCancelled() && ok && strings.TrimSpace(val) == "true" && needToAddAbandonReasonMessage {
-		pr.Status.MarkFailed(AbandonedReason, AbandonedMessage, pr.Namespace, pr.Name)
-		return reconcile.Result{}, client.IgnoreNotFound(r.client.Status().Update(ctx, pr))
+	if isAbandoned(pr) {
+		return r.handleAbandoned(ctx, pr)
 	}
 
-	// active (not pending) or terminal state, pop a pending item off the queue
-	if pr.IsDone() || pr.IsCancelled() || pr.IsGracefullyCancelled() || pr.IsGracefullyStopped() || !pr.IsPending() {
+	if pr.IsDone() || pr.IsCancelled() || pr.IsGracefullyCancelled() || pr.IsGracefullyStopped() {
+		// terminal state, pop a pending item off the queue
 		return reconcile.Result{}, client.IgnoreNotFound(r.unthrottleNextOnQueuePlusCleanup(ctx, pr.Namespace))
 	}
 
-	// have a pending PR
+	return reconcile.Result{}, nil
 
+}
+
+func isAbandoned(pr *v1beta1.PipelineRun) bool {
+	aval, aok := pr.Annotations[AbandonedAnnotation]
+	condition := pr.Status.GetCondition(apis.ConditionSucceeded)
+	needToAddAbandonReasonMessage := condition == nil || condition.Reason != AbandonedReason
+	return pr.IsCancelled() && aok && strings.TrimSpace(aval) == "true" && needToAddAbandonReasonMessage
+}
+
+func isAbandonedPlusFailed(pr *v1beta1.PipelineRun) bool {
+	aval, aok := pr.Annotations[AbandonedAnnotation]
+	condition := pr.Status.GetCondition(apis.ConditionSucceeded)
+	hasReason := condition != nil && condition.Reason == AbandonedReason
+	return pr.IsCancelled() && aok && strings.TrimSpace(aval) == "true" && hasReason
+
+}
+
+func (r *ReconcilePendingPipelineRun) handleAbandoned(ctx context.Context, pr *v1beta1.PipelineRun) (reconcile.Result, error) {
+	// assumes cancelled with our annotation per r.isAbandoned(), so let's bump abandoned metric and mark failed
+	pr.Status.MarkFailed(AbandonedReason, AbandonedMessage, pr.Namespace, pr.Name)
+	return reconcile.Result{}, client.IgnoreNotFound(r.client.Status().Update(ctx, pr))
+
+}
+
+func (r *ReconcilePendingPipelineRun) handlePending(ctx context.Context, pr *v1beta1.PipelineRun) (reconcile.Result, error) {
+	// have a pending PR
 	hardPodCount, pcerr := getHardPodCount(ctx, r.client, pr.Namespace)
 	if pcerr != nil {
 		return reconcile.Result{}, pcerr
 	}
 
 	if hardPodCount > 0 {
-		activeCount, pendingCount, doneCount, totalCount, lerr := r.pipelineRunStats(ctx, pr.Namespace)
+		ret, lerr := pipelineRunStats(ctx, r.client, pr.Namespace)
 		if lerr != nil {
 			return reconcile.Result{}, lerr
 		}
+		cts, _ := ret[pr.Namespace]
 
 		switch {
-		case (totalCount - doneCount) < hardPodCount:
+		case (cts.totalCount - cts.doneCount) < hardPodCount:
 			// below hard pod count quota so remove PR pending
 			break
-		case totalCount == pendingCount:
+		case cts.totalCount == cts.pendingCount:
 			// initial race condition possible if controller starts a bunch before we get events:
 			break
-		case (hardPodCount - 4) <= activeCount: //TODO subtracting ` for the artifact cache, then another 3 for safety buffer, but feels like config option long term
-			// pending item still has to wait because non-terminal items beyond pod limit
+		case (hardPodCount - quotaBuffer) <= cts.activeCount:
+			// see if pending item still has to wait
 			if !r.timedOut(pr) {
 				return reconcile.Result{RequeueAfter: requeueAfter}, nil
 			}
@@ -122,7 +147,7 @@ func (r *ReconcilePendingPipelineRun) Reconcile(ctx context.Context, request rec
 		}
 	}
 
-	// remove pending bit
+	// remove pending bit, make this one active
 	pr.Spec.Status = ""
 	return reconcile.Result{}, client.IgnoreNotFound(r.client.Update(ctx, pr))
 }
@@ -136,39 +161,57 @@ func (r *ReconcilePendingPipelineRun) unthrottleNextOnQueuePlusCleanup(ctx conte
 	}
 	for i, pr := range prList.Items {
 		if pr.IsPending() {
-			prList.Items[i].Spec.Status = ""
-			return r.client.Update(ctx, &prList.Items[i])
+			_, err = r.handlePending(ctx, &prList.Items[i])
+			return err
 		}
 	}
 	return nil
 }
 
-func (r *ReconcilePendingPipelineRun) pipelineRunStats(ctx context.Context, namespace string) (activeCount, pendingCount, doneCount, totalCount int, err error) {
-	prList := v1beta1.PipelineRunList{}
-	opts := &client.ListOptions{Namespace: namespace}
-	if err = r.client.List(ctx, &prList, opts); err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	totalCount = len(prList.Items)
-	activeCount = 0
-	pendingCount = 0
-	doneCount = 0
-	for _, p := range prList.Items {
-		switch {
-		case p.IsPending():
-			pendingCount++
-		case p.IsDone() || p.IsCancelled() || p.IsGracefullyCancelled() || p.IsGracefullyStopped():
-			doneCount++
-		default:
-			activeCount++
-		}
-
-	}
-	return activeCount, pendingCount, doneCount, totalCount, err
-}
-
 func (r *ReconcilePendingPipelineRun) timedOut(pr *v1beta1.PipelineRun) bool {
+	// if not set yet, say not timed out
+	if pr.ObjectMeta.CreationTimestamp.IsZero() {
+		return false
+	}
 	timeout := pr.ObjectMeta.CreationTimestamp.Add(abandonAfter)
 	return timeout.Before(time.Now())
+}
+
+type counts struct {
+	activeCount    int
+	pendingCount   int
+	abandonedCount int
+	doneCount      int
+	totalCount     int
+}
+
+func pipelineRunStats(ctx context.Context, c client.Client, namespace string) (map[string]counts, error) {
+	var err error
+	prList := v1beta1.PipelineRunList{}
+	opts := &client.ListOptions{Namespace: namespace}
+	if err = c.List(ctx, &prList, opts); err != nil {
+		return map[string]counts{}, err
+	}
+
+	ret := map[string]counts{}
+	for _, p := range prList.Items {
+		ct, ok := ret[p.Namespace]
+		if !ok {
+			ct = counts{}
+		}
+		ct.totalCount++
+		switch {
+		case p.IsPending():
+			ct.pendingCount++
+		case isAbandonedPlusFailed(&p):
+			ct.abandonedCount++
+		case p.IsDone() || p.IsCancelled() || p.IsGracefullyCancelled() || p.IsGracefullyStopped():
+			ct.doneCount++
+		default:
+			ct.activeCount++
+		}
+		ret[p.Namespace] = ct
+
+	}
+	return ret, err
 }

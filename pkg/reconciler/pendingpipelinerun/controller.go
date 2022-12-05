@@ -8,5 +8,6 @@ import (
 
 func SetupPRReconcilerWithManager(mgr ctrl.Manager) error {
 	r := newPRReconciler(mgr)
+	InitPrometheus(mgr.GetClient())
 	return ctrl.NewControllerManagedBy(mgr).For(&v1beta1.PipelineRun{}).Complete(r)
 }

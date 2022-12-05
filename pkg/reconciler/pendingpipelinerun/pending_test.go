@@ -5,20 +5,13 @@ import (
 	"testing"
 	"time"
 
-	quotav1 "github.com/openshift/api/quota/v1"
-	fakequotaclientset "github.com/openshift/client-go/quota/clientset/versioned/fake"
-	"github.com/redhat-appstudio/jvm-build-service/pkg/reconciler/clusterresourcequota"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/api/node/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"knative.dev/pkg/apis"
@@ -26,23 +19,9 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func setupClientAndPRReconciler(useOpenshift bool, objs ...runtimeclient.Object) (runtimeclient.Client, *ReconcilePendingPipelineRun) {
-	scheme := runtime.NewScheme()
-	_ = v1alpha1.AddToScheme(scheme)
-	_ = v1beta1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = quotav1.AddToScheme(scheme)
-	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-	if useOpenshift {
-		clusterresourcequota.QuotaClient = fakequotaclientset.NewSimpleClientset()
-	}
-	reconciler := &ReconcilePendingPipelineRun{client: client, scheme: scheme, eventRecorder: &record.FakeRecorder{}}
-	return client, reconciler
-}
-
 func TestPendingPipelineRun(t *testing.T) {
 	g := NewGomegaWithT(t)
-	client, reconciler := setupClientAndPRReconciler(false)
+	client, reconciler := SetupClientAndPRReconciler(false)
 
 	pr := v1beta1.PipelineRun{}
 	pr.Namespace = metav1.NamespaceDefault
@@ -75,7 +54,7 @@ func TestPendingPipelinerunUnderK8sQuota(t *testing.T) {
 	}
 	quota.Namespace = metav1.NamespaceDefault
 	quota.Name = "foo"
-	client, reconciler := setupClientAndPRReconciler(false, quota)
+	client, reconciler := SetupClientAndPRReconciler(false, quota)
 
 	pr := v1beta1.PipelineRun{}
 	pr.Namespace = metav1.NamespaceDefault
@@ -108,7 +87,7 @@ func TestExceedK8sQuota(t *testing.T) {
 	}
 	quota.Namespace = metav1.NamespaceDefault
 	quota.Name = "foo"
-	client, reconciler := setupClientAndPRReconciler(false, quota)
+	client, reconciler := SetupClientAndPRReconciler(false, quota)
 	prs := []v1beta1.PipelineRun{
 		{ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "test1"}},
 		{ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "test2"}},
@@ -169,7 +148,7 @@ func TestExceedK8sQuotaNotTimedOut(t *testing.T) {
 	}
 	quota.Namespace = metav1.NamespaceDefault
 	quota.Name = "foo"
-	client, reconciler := setupClientAndPRReconciler(false, quota)
+	client, reconciler := SetupClientAndPRReconciler(false, quota)
 	prs := []v1beta1.PipelineRun{
 		{ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "test1", CreationTimestamp: metav1.NewTime(time.Now())}},
 		{ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "test2", CreationTimestamp: metav1.NewTime(time.Now())}},
@@ -195,7 +174,7 @@ func TestExceedK8sQuotaNotTimedOut(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(pr.Spec.Status).To(Equal(v1beta1.PipelineRunSpecStatus("")))
 
-	// with start time set, the PR should registered as timed out
+	// with start time set to something recent, the PR should not register as timed out
 	g.Expect(reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: prs[1].Namespace, Name: prs[1].Name}}))
 	key = runtimeclient.ObjectKey{Namespace: prs[1].Namespace, Name: prs[1].Name}
 	g.Expect(client.Get(ctx, key, &pr)).NotTo(HaveOccurred())

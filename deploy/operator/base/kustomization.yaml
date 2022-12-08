@@ -11,3 +11,4 @@ resources:
   - metricservice.yaml
   - servicemonitor.yaml
   - servicemonitor_rbac.yaml
+  - prometheus_rules.yaml
